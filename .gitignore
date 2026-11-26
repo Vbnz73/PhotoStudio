@@ -1,0 +1,43 @@
+# Виртуальные окружения Python
+.venv/
+.venv_*/
+venv/
+env/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Сборка и результаты упаковки
+build/
+dist/
+
+# Временные файлы
+*.log
+*.tmp
+*.bak
+*.old
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Настройки редакторов
+.vscode/
+.idea/
+
+# Локальные настройки и секреты
+.env
+.env.*
+!.env.example
+
+# Личные фотографии и результаты обработки
+photos/
+Photos/
+output/
+Output/
+exports/
+Exports/
+
+# Исходные архивы старых форматов, не требуемые текущей версии
+FormatsRU2.data
