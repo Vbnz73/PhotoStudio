@@ -5,13 +5,14 @@ from ctypes import wintypes
 import shutil
 import math
 import json
+import hashlib
 import cv2
 import mediapipe as mp
 import numpy as np
 import xml.etree.ElementTree as ET
 import copy
 import uuid
-import concurrent.futures
+import concurrent.futures.thread
 concurrent.futures.ThreadPoolExecutor = concurrent.futures.thread.ThreadPoolExecutor
 
 from PySide6.QtWidgets import (
@@ -32,10 +33,10 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import (
     QAction, QPixmap, QImage, QPainter, QPen, QColor, QPainterPath,
-    QIcon, QTransform, QImageReader, QKeySequence, QDrag, QShortcut
+    QIcon, QTransform, QImageReader, QImageWriter, QKeySequence, QDrag, QShortcut
 )
 from PySide6.QtCore import (
-    QFile, QEvent,
+    QFile, QSaveFile, QIODevice, QEvent,
     Qt, QPointF, QRectF, QDir, QSize, QSettings, QTimer,
     QPoint, QObject, QRunnable, QThreadPool, Signal, QModelIndex,
     QMimeData, QUrl
@@ -44,6 +45,10 @@ from thumbnail_provider import get_thumbnail
 from photo_grid import PhotoGrid, THUMBNAIL_SIZE
 from markup_view import MarkupView
 from photo_document import CompositeRenderer, PhotoDocument, PhotoLayer
+from photo_export import (
+    MIN_DPI, MAX_DPI, calculate_export_size, estimate_print_size_mm,
+    prepare_export_image, set_image_dpi,
+)
 from mask_feather import MaskFeather
 
 
@@ -97,6 +102,9 @@ IMAGE_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".bmp",
     ".webp", ".tif", ".tiff"
 )
+
+EXPORT_PNG_FILTER = "PNG (*.png)"
+EXPORT_JPEG_FILTER = "JPEG (*.jpg *.jpeg)"
 
 
 # ---------------------------------------------------------
@@ -2533,9 +2541,153 @@ class ScreenColorPicker(QWidget):
         self.setFocus()
 
 
+class ExportOptionsDialog(QDialog):
+    """PPI and explicit re-selection of the locked physical format."""
+
+    def __init__(self, format_info, previous_size=None, parent=None,
+                 selection_changed=False):
+        super().__init__(parent)
+        self.setWindowTitle("Параметры экспорта")
+        self.format_info = format_info
+        self.previous_size = previous_size
+        self._size = None
+        try:
+            # При первом открытии формат выбирается с исходным PPI 300.
+            # Дальнейшее изменение одного PPI сохраняет этот растр.
+            self.baseline_size = previous_size or calculate_export_size(
+                format_info.get("width"), format_info.get("height"),
+                format_info.get("units", "mm"), 300,
+            )
+        except (ValueError, TypeError, OverflowError):
+            # Если 300 PPI не даёт допустимого растра, сначала нужен
+            # явный расчёт формата при другом разрешении.
+            self.baseline_size = None
+
+        layout = QFormLayout(self)
+        description = QLabel(
+            f"{format_info.get('name', 'Выбранный формат')}: "
+            f"{format_info.get('width')} × {format_info.get('height')} "
+            f"{format_info.get('units', 'mm')}"
+        )
+        description.setTextFormat(Qt.TextFormat.PlainText)
+        description.setWordWrap(True)
+        layout.addRow("Зафиксированный формат:", description)
+        if selection_changed:
+            notice = QLabel(
+                "Формат в списке изменён после фиксации. "
+                "Экспортируется формат зафиксированной композиции."
+            )
+            notice.setWordWrap(True)
+            layout.addRow(notice)
+
+        self.ppi_spin = QSpinBox(self)
+        self.ppi_spin.setRange(MIN_DPI, MAX_DPI)
+        self.ppi_spin.setValue(previous_size.dpi if previous_size else 300)
+        layout.addRow("Разрешение, PPI:", self.ppi_spin)
+
+        self.recalculate_check = QCheckBox(
+            "Пересчитать пиксели по зафиксированному формату", self
+        )
+        self.recalculate_check.setChecked(self.baseline_size is None)
+        self.recalculate_check.setEnabled(self.baseline_size is not None)
+        self.recalculate_check.setToolTip(
+            "Без повторного выбора формата изменение PPI не меняет размер в пикселях."
+        )
+        layout.addRow(self.recalculate_check)
+
+        self.preview_label = QLabel(self)
+        self.preview_label.setWordWrap(True)
+        layout.addRow("Результат:", self.preview_label)
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Далее")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addRow(self.buttons)
+        self.ppi_spin.valueChanged.connect(self._update_preview)
+        self.recalculate_check.toggled.connect(self._update_preview)
+        self._update_preview()
+
+    def _update_preview(self, *_):
+        try:
+            dpi = self.ppi_spin.value()
+            if self.baseline_size is not None and not self.recalculate_check.isChecked():
+                size = calculate_export_size(
+                    self.baseline_size.width_px, self.baseline_size.height_px, "px", dpi
+                )
+            else:
+                size = calculate_export_size(
+                    self.format_info.get("width"), self.format_info.get("height"),
+                    self.format_info.get("units", "mm"), dpi,
+                )
+            width_mm, height_mm = estimate_print_size_mm(size.width_px, size.height_px, dpi)
+        except (ValueError, TypeError, OverflowError) as error:
+            self._size = None
+            self.preview_label.setText(f"Невозможно рассчитать размер: {error}")
+        else:
+            self._size = size
+            self.preview_label.setText(
+                f"{size.width_px} × {size.height_px} px\n"
+                f"При {dpi} PPI ≈ {width_mm:.6f} × {height_mm:.6f} мм"
+            )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(self._size is not None)
+
+    def selected_size(self):
+        return self._size
+
+
+def _export_target_path(path, selected_filter):
+    """Choose the encoder by explicit extension, or append the selected one."""
+    extension = os.path.splitext(path)[1].lower()
+    if extension == ".png":
+        return path, "png"
+    if extension in (".jpg", ".jpeg"):
+        return path, "jpeg"
+    if extension:
+        raise ValueError("Выберите файл с расширением .png, .jpg или .jpeg.")
+    if selected_filter == EXPORT_JPEG_FILTER:
+        return path + ".jpg", "jpeg"
+    return path + ".png", "png"
+
+
+def _same_export_path(first, second):
+    """Protect the source even if the chosen path is a link or alias."""
+    if not first or not second:
+        return False
+    try:
+        if os.path.samefile(first, second):
+            return True
+    except OSError:
+        pass
+    return os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second))
+
+
+def _write_export_image(path, image, image_format):
+    """Write the prepared image atomically; leave an existing file intact on failure."""
+    target = QSaveFile(path)
+    target.setDirectWriteFallback(False)
+    if not target.open(QIODevice.OpenModeFlag.WriteOnly):
+        raise OSError(target.errorString())
+    try:
+        writer = QImageWriter(target, b"JPEG" if image_format == "jpeg" else b"PNG")
+        if image_format == "jpeg":
+            writer.setQuality(95)
+        if not writer.write(image):
+            raise OSError(writer.errorString())
+        if not target.commit():
+            raise OSError(target.errorString())
+    except Exception:
+        target.cancelWriting()
+        raise
+
+
 class PhotoStudio(QMainWindow):
     def __init__(self):
         super().__init__()
+        # resizeEvent может прийти до открытия первой фотографии.
+        self.current_pixmap = QPixmap()
         self.settings = QSettings("PhotoStudio", "PhotoStudio")
         self.setWindowTitle("Фото на документы — PhotoStudio")
 
@@ -2548,6 +2700,8 @@ class PhotoStudio(QMainWindow):
         # Формат папки может открыть фото ещё до первого выбора формата.
         self.current_markup_type = "Разметка по двум точкам"
         self.photo_document = None
+        self._export_size = None
+        self._export_cache = None
         self.composite_renderer = CompositeRenderer()
         # background_mask_edit is M_edit: the source mask modified by brushes.
         # background_mask remains a compatibility alias used by older handlers.
@@ -2920,6 +3074,12 @@ class PhotoStudio(QMainWindow):
         file_menu.addAction(open_folder_action)
 
         file_menu.addSeparator()
+        export_action = QAction("Экспорт композиции…", self)
+        export_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        export_action.triggered.connect(self.export_composition)
+        file_menu.addAction(export_action)
+
+        file_menu.addSeparator()
         exit_action = QAction("Выход", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
@@ -2932,6 +3092,162 @@ class PhotoStudio(QMainWindow):
         markup_action = QAction("Разметка", self)
         markup_action.triggered.connect(lambda: self.change_mode("markup"))
         mode_menu.addAction(markup_action)
+
+    def export_composition(self):
+        document = self.photo_document
+        if document is None or not self.photo_view.composition_locked:
+            QMessageBox.warning(
+                self, "Экспорт композиции",
+                "Сначала откройте фотографию и зафиксируйте композицию."
+            )
+            return
+        if self._background_border_slider_dragging:
+            QMessageBox.warning(
+                self, "Экспорт композиции",
+                "Отпустите ползунок границы фона перед экспортом."
+            )
+            return
+
+        format_info = document.metadata.get("export_format")
+        if not isinstance(format_info, dict):
+            QMessageBox.warning(
+                self, "Экспорт композиции",
+                "У зафиксированной композиции нет формата. Вернитесь в разметку, "
+                "выберите формат и зафиксируйте композицию заново."
+            )
+            return
+
+        options = ExportOptionsDialog(
+            format_info, self._export_size, self,
+            selection_changed=format_info != self.format_combo.currentData(),
+        )
+        if options.exec() != QDialog.DialogCode.Accepted:
+            return
+        size = options.selected_size()
+        if size is None:
+            QMessageBox.warning(self, "Экспорт композиции", "Некорректный размер экспорта.")
+            return
+        if self.photo_document is not document or not self.photo_view.composition_locked:
+            QMessageBox.warning(
+                self, "Экспорт композиции", "Композиция изменилась. Начните экспорт заново."
+            )
+            return
+
+        source_path = getattr(self, "current_photo_path", None) or document.source_path
+        if source_path:
+            name = os.path.splitext(os.path.basename(source_path))[0] + "_готово"
+            suggested_path = os.path.join(os.path.dirname(source_path), name)
+        else:
+            suggested_path = ""
+        default_filter = (
+            EXPORT_JPEG_FILTER
+            if self._export_cache is not None and self._export_cache["format"] == "jpeg"
+            else EXPORT_PNG_FILTER
+        )
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Экспорт композиции", suggested_path,
+            f"{EXPORT_PNG_FILTER};;{EXPORT_JPEG_FILTER}",
+            default_filter, QFileDialog.Option.DontConfirmOverwrite,
+        )
+        if not path:
+            return
+        try:
+            path, image_format = _export_target_path(path, selected_filter or default_filter)
+        except ValueError as error:
+            QMessageBox.warning(self, "Экспорт композиции", str(error))
+            return
+
+        def is_source_path():
+            return any(
+                _same_export_path(path, source)
+                for source in (document.source_path, getattr(self, "current_photo_path", None))
+            )
+
+        if is_source_path():
+            QMessageBox.warning(
+                self, "Экспорт композиции",
+                "Нельзя перезаписать исходную фотографию. Выберите другое имя."
+            )
+            return
+        if os.path.lexists(path):
+            answer = QMessageBox.question(
+                self, "Замена файла", f"Файл уже существует:\n{path}\n\nЗаменить его?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        # Модальные диалоги обрабатывают события: перед снимком проверяем
+        # документ и применяем последнее ожидающее обновление ползунка.
+        if self.photo_document is not document or not self.photo_view.composition_locked:
+            QMessageBox.warning(
+                self, "Экспорт композиции", "Композиция изменилась. Начните экспорт заново."
+            )
+            return
+        if self._background_border_slider_dragging:
+            QMessageBox.warning(
+                self, "Экспорт композиции", "Отпустите ползунок границы фона перед экспортом."
+            )
+            return
+        if is_source_path():
+            QMessageBox.warning(
+                self, "Экспорт композиции",
+                "Нельзя перезаписать исходную фотографию. Выберите другое имя."
+            )
+            return
+
+        try:
+            if self.background_border_preview_timer.isActive():
+                self.background_border_preview_timer.stop()
+                try:
+                    self._refresh_background_border_preview()
+                except Exception:
+                    # Не теряем отложенное изменение при ошибке подготовки.
+                    self.background_border_preview_timer.start()
+                    raise
+
+            # Проверяем размер холста до выделения памяти под композит.
+            canvas = document.canvas_size
+            calculate_export_size(canvas.width(), canvas.height(), "px", size.dpi)
+            # Сверяем хэш пикселей композита, а не предпросмотр виджета:
+            # изменения слоёв, масок или видимости обновляют кэш экспорта.
+            composite = self.composite_renderer.render(document)
+            if composite.isNull() or composite.size() != document.canvas_size:
+                raise RuntimeError("Не удалось создать композит документа")
+            signature = hashlib.sha256(composite.constBits()).digest()
+            del composite
+            cache = self._export_cache
+            if (
+                cache is not None
+                and cache["document"] is document
+                and cache["format"] == image_format
+                and cache["image"].size() == QSize(size.width_px, size.height_px)
+                and cache["signature"] == signature
+            ):
+                # Изменение только PPI готового растра не вызывает ресэмплинг.
+                image = set_image_dpi(cache["image"], size.dpi)
+            else:
+                image = prepare_export_image(
+                    document, size.width_px, size.height_px, "px", size.dpi,
+                    image_format=image_format,
+                )
+            _write_export_image(path, image, image_format)
+        except Exception as error:
+            QMessageBox.critical(
+                self, "Ошибка экспорта",
+                f"Не удалось сохранить композицию:\n{str(error) or type(error).__name__}",
+            )
+            return
+
+        self._export_size = size
+        self._export_cache = {
+            "document": document, "format": image_format,
+            "signature": signature, "image": image,
+        }
+        self.statusBar().showMessage(
+            f"Сохранено: {path} ({size.width_px} × {size.height_px} px, {size.dpi} PPI)"
+        )
 
     def open_format_settings(self):
         dialog = FormatSettingsDialog(self.formats, self)
@@ -5017,7 +5333,11 @@ class PhotoStudio(QMainWindow):
             ),
             composition_rect=composition_rect,
             source_path=self.current_photo_path,
+            # Сохраняем формат рамки в момент фиксации, а не выбранный позже.
+            metadata={"export_format": self.format_combo.currentData()},
         )
+        self._export_size = None
+        self._export_cache = None
         working_pixmap = QPixmap.fromImage(
             self.composite_renderer.render(self.photo_document)
         )
@@ -5110,6 +5430,11 @@ class PhotoStudio(QMainWindow):
         )
 
     def unlock_composition(self):
+        format_changed = (
+            self.photo_document is not None
+            and self.photo_document.metadata.get("export_format")
+            != self.format_combo.currentData()
+        )
         state = self.markup_state_before_lock
         view = self.photo_view
 
@@ -5135,12 +5460,18 @@ class PhotoStudio(QMainWindow):
 
         self.markup_state_before_lock = None
         self.photo_document = None
+        self._export_size = None
+        self._export_cache = None
         self.working_pixmap = None
         self.background_source_pixmap = None
         self._set_background_mask_edit(None)
         self.background_protected_mask = None
         view.background_mask = None
         view.composition_locked = False
+        if format_changed:
+            # Новый выбор не менял зафиксированный документ. Применяем его
+            # к рамке только после возвращения в разметку.
+            self.on_format_selected(self.format_combo.currentIndex())
         view.update()
 
         self.left_eye_button.setEnabled(True)
@@ -6175,7 +6506,14 @@ class PhotoStudio(QMainWindow):
                 "Не удалось открыть выбранную фотографию."
             )
             return
+        format_changed = (
+            self.photo_document is not None
+            and self.photo_document.metadata.get("export_format")
+            != self.format_combo.currentData()
+        )
         self.photo_document = None
+        self._export_size = None
+        self._export_cache = None
         self.current_photo_path = path
         self.current_pixmap = pixmap
         # Для новой фотографии рабочая копия ещё не создана.
@@ -6210,6 +6548,8 @@ class PhotoStudio(QMainWindow):
         self._update_background_replacement_color_controls()
 
         self.photo_view.set_photo(pixmap)
+        if format_changed:
+            self.on_format_selected(self.format_combo.currentIndex())
 
         # Снимаем блокировки кнопок, оставшиеся от предыдущей фотографии.
         for button in (
