@@ -22,14 +22,14 @@ from photo_export import (
 class ExportSizeTests(unittest.TestCase):
     def test_reference_sizes_and_supported_units(self):
         cases = [
-            (35, 45, "mm", 300, (413, 531)),
+            (35, 45, "mm", 300, (414, 532)),
             (35, 45, "mm", 600, (827, 1063)),
-            (3.5, 4.5, "cm", 300, (413, 531)),
+            (3.5, 4.5, "cm", 300, (414, 532)),
             (Decimal("3.5"), Decimal("4.5"), "cm", 600, (827, 1063)),
             (2, 2, "in", 300, (600, 600)),
             (600, 600, "px", 300, (600, 600)),
             (354.0, 472.0, "px", 300, (354, 472)),
-            (45, 35, "mm", 300, (531, 413)),
+            (45, 35, "mm", 300, (532, 414)),
         ]
         for width, height, units, dpi, expected in cases:
             with self.subTest(width=width, height=height, units=units, dpi=dpi):
@@ -46,19 +46,37 @@ class ExportSizeTests(unittest.TestCase):
         self.assertEqual([r.dpi for r in results], [MIN_DPI, 72, 300, 600, MAX_DPI])
         self.assertNotEqual(results[2].dots_per_meter, results[3].dots_per_meter)
 
-    def test_round_half_up_at_exact_and_near_half_pixel(self):
-        result = calculate_export_size(Decimal("0.5"), Decimal("1.5"), "in", 1)
-        self.assertEqual((result.width_px, result.height_px), (1, 2))
-        result = calculate_export_size(Decimal("12.7"), Decimal("38.1"), "mm", 1)
-        self.assertEqual((result.width_px, result.height_px), (1, 2))
-        result = calculate_export_size(
-            Decimal("1.499999999999999999999999999999999999"),
-            Decimal("1.500000000000000000000000000000000001"), "in", 1,
+    def test_ceil_at_and_around_integer_pixel_boundaries(self):
+        for width, height, units, expected in (
+            (Decimal("0.5"), Decimal("1.5"), "in", (1, 2)),
+            (Decimal("12.7"), Decimal("38.1"), "mm", (1, 2)),
+            (Decimal("25.4"), Decimal("50.8"), "mm", (1, 2)),
+            (Decimal("0.999999999999999999999999999999999999"),
+             Decimal("1.000000000000000000000000000000000001"), "in", (1, 2)),
+            (Decimal("1.499999999999999999999999999999999999"),
+             Decimal("1.500000000000000000000000000000000001"), "in", (2, 2)),
+        ):
+            with self.subTest(width=width, height=height, units=units):
+                result = calculate_export_size(width, height, units, 1)
+                self.assertEqual((result.width_px, result.height_px), expected)
+
+    def test_reference_table_and_explicit_reselection(self):
+        first = calculate_export_size(35, 45, "mm", 300)
+        only_dpi_changed = calculate_export_size(first.width_px, first.height_px, "px", 600)
+        selected_again = calculate_export_size(35, 45, "mm", 600)
+        cases = (
+            (first, (414, 532), (35.052, 45.0426666667)),
+            (only_dpi_changed, (414, 532), (17.526, 22.5213333333)),
+            (selected_again, (827, 1063), (35.0096666667, 45.0003333333)),
         )
-        self.assertEqual((result.width_px, result.height_px), (1, 2))
-        with self.assertRaises(ValueError):
-            calculate_export_size(Decimal("0.499999999999999999999999999999999999"),
-                                  1, "in", 1)
+        for size, expected_px, expected_mm in cases:
+            with self.subTest(size=size):
+                self.assertEqual((size.width_px, size.height_px), expected_px)
+                actual_mm = estimate_print_size_mm(size.width_px, size.height_px, size.dpi)
+                for actual, expected in zip(actual_mm, expected_mm):
+                    self.assertAlmostEqual(float(actual), expected, places=8)
+        self.assertEqual((first.dpi, only_dpi_changed.dpi, selected_again.dpi),
+                         (300, 600, 600))
 
     def test_dots_per_meter(self):
         for dpi, expected in ((1, 39), (72, 2835), (96, 3780),
@@ -73,9 +91,9 @@ class ExportSizeTests(unittest.TestCase):
                          (Decimal("50.8"), Decimal("50.8")))
         self.assertEqual(estimate_print_size_mm(600.0, 600, 600),
                          (Decimal("25.4"), Decimal("25.4")))
-        width, height = estimate_print_size_mm(413, 531, 300)
-        self.assertAlmostEqual(float(width), 34.9673333333, places=8)
-        self.assertAlmostEqual(float(height), 44.958, places=8)
+        width, height = estimate_print_size_mm(414, 532, 300)
+        self.assertAlmostEqual(float(width), 35.052, places=8)
+        self.assertAlmostEqual(float(height), 45.0426666667, places=8)
 
     def test_invalid_dimensions(self):
         invalid = (0, -1, True, False, None, "35", "bad", [],
@@ -117,23 +135,27 @@ class ExportSizeTests(unittest.TestCase):
         result = calculate_export_size(600.0, Decimal("600.000"), "px", 300)
         self.assertEqual((result.width_px, result.height_px), (600, 600))
 
-    def test_rounded_zero_is_rejected(self):
+    def test_small_positive_physical_sizes_ceil_to_one_pixel(self):
         for units in ("mm", "cm", "in"):
             with self.subTest(units=units):
-                with self.assertRaises(ValueError):
-                    calculate_export_size(Decimal("0.001"), 1, units, 1)
-        with self.assertRaises(ValueError):
-            calculate_export_size(Decimal("1e-1000000"), 1, "in", 1)
+                result = calculate_export_size(Decimal("0.001"), 1, units, 1)
+                self.assertEqual(result.width_px, 1)
+                # Огромный отрицательный показатель не должен создавать
+                # гигантский знаменатель Fraction или отклонять положительный размер.
+                tiny = calculate_export_size(Decimal("1e-1000000"),
+                                             Decimal("1e-1000000"), units, MAX_DPI)
+                self.assertEqual((tiny.width_px, tiny.height_px), (1, 1))
 
     def test_side_limit_in_pixels_and_physical_units(self):
         self.assertEqual(MIN_SIDE_PX, 1)
         self.assertEqual(MAX_SIDE_PX, 65_500)
         result = calculate_export_size(MAX_SIDE_PX, 1, "px", 300)
         self.assertEqual((result.width_px, result.height_px), (MAX_SIDE_PX, 1))
-        result = calculate_export_size(Decimal("65500.49"), 1, "in", 1)
+        result = calculate_export_size(Decimal("65500"), 1, "in", 1)
         self.assertEqual(result.width_px, MAX_SIDE_PX)
         for width, units in ((MAX_SIDE_PX + 1, "px"),
-                             (Decimal("65500.5"), "in"),
+                             (Decimal("65500.000000000001"), "in"),
+                             (Decimal("65500.49"), "in"),
                              (Decimal("1e1000000"), "mm")):
             with self.subTest(width=width, units=units):
                 with self.assertRaises(ValueError):
@@ -168,7 +190,7 @@ class ExportSizeTests(unittest.TestCase):
                     operation()
 
     def test_decimal_context_does_not_change_calculations(self):
-        expected_print_size = estimate_print_size_mm(413, 531, 300)
+        expected_print_size = estimate_print_size_mm(414, 532, 300)
         with localcontext() as context:
             context.prec = 2
             context.rounding = ROUND_DOWN
@@ -177,7 +199,7 @@ class ExportSizeTests(unittest.TestCase):
             result = calculate_export_size(Decimal("12.7"), Decimal("38.1"), "mm", 1)
             self.assertEqual((result.width_px, result.height_px), (1, 2))
             self.assertEqual(dpi_to_dots_per_meter(300), 11811)
-            self.assertEqual(estimate_print_size_mm(413, 531, 300), expected_print_size)
+            self.assertEqual(estimate_print_size_mm(414, 532, 300), expected_print_size)
 
     def test_result_is_immutable(self):
         result = calculate_export_size(35, 45, "mm", 300)

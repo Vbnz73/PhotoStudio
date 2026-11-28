@@ -14,6 +14,7 @@ from photo_export import (
     calculate_export_size,
     dpi_to_dots_per_meter,
     get_image_dpi,
+    prepare_export_image,
     set_image_dpi,
 )
 
@@ -269,6 +270,8 @@ class QImageDpiTests(unittest.TestCase):
             for dpi in (300, 600):
                 with self.subTest(dpi=dpi):
                     size = calculate_export_size(35, 45, "mm", dpi)
+                    self.assertEqual((size.width_px, size.height_px),
+                                     {300: (414, 532), 600: (827, 1063)}[dpi])
                     image = set_image_dpi(self.make_image(size.width_px, size.height_px), dpi)
                     data, decoded = self.write_and_read(Path(folder) / f"{dpi}.png", b"PNG", image)
                     x_dpm, y_dpm, unit = read_png_phys(data)
@@ -285,6 +288,9 @@ class QImageDpiTests(unittest.TestCase):
             for dpi in (127, 300, 600):
                 with self.subTest(dpi=dpi):
                     size = calculate_export_size(35, 45, "mm", dpi)
+                    self.assertEqual((size.width_px, size.height_px),
+                                     {127: (175, 225), 300: (414, 532),
+                                      600: (827, 1063)}[dpi])
                     image = set_image_dpi(self.make_image(size.width_px, size.height_px), dpi)
                     data, decoded = self.write_and_read(Path(folder) / f"{dpi}.jpg", b"JPEG", image)
                     unit, x_density, y_density, has_extra = read_jpeg_jfif(data)
@@ -297,6 +303,70 @@ class QImageDpiTests(unittest.TestCase):
                     x_dpi, y_dpi = get_image_dpi(decoded)
                     self.assertAlmostEqual(x_dpi, dpi, delta=0.05)
                     self.assertAlmostEqual(y_dpi, dpi, delta=0.05)
+
+    def test_prepared_composite_in_real_png_and_jpeg(self):
+        try:
+            from PySide6.QtCore import QSize
+            from photo_document import PhotoDocument, PhotoLayer
+        except ImportError as error:
+            self.skipTest(f"Для проверки композита нужен NumPy: {error}")
+
+        source = QImage(36, 46, QImage.Format.Format_RGBA8888)
+        source.fill(QColor(255, 0, 0, 128))
+        source.setText("XML:com.adobe.xmp", "old resolution 72")
+        for y in range(10):
+            for x in range(10):
+                source.setPixelColor(x, y, QColor(0, 0, 0, 0))
+        document = PhotoDocument(source, QSize(36, 46), [PhotoLayer(source, layer_id="base")])
+        png = prepare_export_image(document, 35, 45, "mm", 300, image_format="png")
+        jpeg = prepare_export_image(document, 35, 45, "mm", 300, image_format="jpeg")
+        self.assertEqual((png.width(), png.height()), (414, 532))
+        self.assertEqual((jpeg.width(), jpeg.height()), (414, 532))
+        self.assertEqual(png.pixelColor(0, 0), QColor("white"))
+        self.assertEqual(png.pixelColor(50, 50).alpha(), 0)
+        self.assertEqual(png.pixelColor(200, 250).getRgb(), (255, 0, 0, 128))
+        self.assertEqual(jpeg.pixelColor(50, 50), QColor("white"))
+        self.assertEqual(jpeg.pixelColor(200, 250).getRgb(), (255, 127, 127, 255))
+
+        with tempfile.TemporaryDirectory(prefix="photostudio-composite-") as folder:
+            folder = Path(folder)
+            png_data, decoded_png = self.write_and_read(folder / "300.png", b"PNG", png)
+            self.assertEqual(read_png_phys(png_data), (11811, 11811, 1))
+            self.assertEqual(decoded_png.pixelColor(0, 0), QColor("white"))
+            self.assertEqual(decoded_png.pixelColor(50, 50).alpha(), 0)
+            self.assertEqual(decoded_png.pixelColor(200, 250).getRgb(), (255, 0, 0, 128))
+
+            jpeg_data, decoded_jpeg = self.write_and_read(folder / "300.jpg", b"JPEG", jpeg)
+            self.assertEqual(read_jpeg_jfif(jpeg_data), (1, 300, 300, False))
+            self.assertFalse(decoded_jpeg.hasAlphaChannel())
+            for position, expected in (((50, 50), (255, 255, 255)),
+                                       ((200, 250), (255, 127, 127))):
+                actual = decoded_jpeg.pixelColor(*position).getRgb()[:3]
+                self.assertTrue(all(abs(a - e) <= 4 for a, e in zip(actual, expected)),
+                                f"JPEG {position}: {actual} != {expected}")
+
+            # Только метаданные: готовые пиксели не пересчитываются.
+            with patch.object(photo_export, "_resample_composite",
+                              side_effect=AssertionError("DPI-only change resampled")):
+                png_600 = set_image_dpi(png, 600)
+                jpeg_600 = set_image_dpi(jpeg, 600)
+            self.assertEqual(bytes(png.constBits()), bytes(png_600.constBits()))
+            self.assertEqual(bytes(jpeg.constBits()), bytes(jpeg_600.constBits()))
+            changed_data, changed_decoded = self.write_and_read(folder / "600-only.png",
+                                                                 b"PNG", png_600)
+            self.assertEqual((changed_decoded.width(), changed_decoded.height()), (414, 532))
+            self.assertEqual(read_png_phys(changed_data), (23622, 23622, 1))
+            jpeg_600_data, jpeg_600_decoded = self.write_and_read(folder / "600-only.jpg",
+                                                                   b"JPEG", jpeg_600)
+            self.assertEqual((jpeg_600_decoded.width(), jpeg_600_decoded.height()), (414, 532))
+            self.assertEqual(read_jpeg_jfif(jpeg_600_data), (1, 600, 600, False))
+
+            # Повторный выбор физических размеров заново рассчитывает растр.
+            selected_again = prepare_export_image(document, 35, 45, "mm", 600)
+            selected_data, selected_decoded = self.write_and_read(folder / "600-new.png",
+                                                                   b"PNG", selected_again)
+            self.assertEqual((selected_decoded.width(), selected_decoded.height()), (827, 1063))
+            self.assertEqual(read_png_phys(selected_data), (23622, 23622, 1))
 
     def test_dpi_limits_in_real_png_and_jpeg(self):
         with tempfile.TemporaryDirectory(prefix="photostudio-dpi-") as folder:
